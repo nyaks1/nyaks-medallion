@@ -205,3 +205,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Pipeline outputs — NEVER commit these
+# The scoring system mounts its own /data/output — any baked-in output is ignored
+data/
+output/
+
+# Spark temp files
+derby.log
+metastore_db/
+spark-warehouse/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+ 
+# OS
+.DS_Store
+Thumbs.db
