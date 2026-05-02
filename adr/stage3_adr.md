@@ -1,86 +1,70 @@
 # Architecture Decision Record: Stage 3 Streaming Extension
 
 **File:** `adr/stage3_adr.md`
-**Author:** [your name]
-**Date:** [date of submission]
+**Author:** Nyakallo Masiu
+**Date:** 2026-05-02
 **Status:** Final
-
----
-
-## Instructions (remove this section before submitting)
-
-This ADR is required at Stage 3. It must be present in your repository at `adr/stage3_adr.md` when you push the `stage3-submission` tag.
-
-The ADR is human-reviewed at the finalist stage and is worth **2 points** out of 100. Scoring:
-- All three questions addressed substantively: **2 points**
-- One or two questions answered superficially: **1 point**
-- ADR absent or none of the questions addressed: **0 points**
-
-**What "substantive" means:** Each question requires a minimum of approximately 100 words of specific, concrete reasoning about your own pipeline. General statements ("I would have made it more modular") do not qualify as substantive. Specific statements do ("I would have separated the schema definition from the transformation logic and placed it in `config/schemas.py`, because when Stage 3 required a new output table I had to modify `transform.py` in three places that all referenced the Gold schema directly").
-
-**What reviewers are looking for:** Evidence that you understand the architectural trade-offs you made, not evidence that you know what good architecture looks like in the abstract. Reference your own code. Name specific files, classes, or design decisions.
-
-Delete these instructions before submitting.
 
 ---
 
 ## Context
 
-[1–2 paragraphs describing the Stage 3 requirement and the constraints you were working within.]
+Stage 3 requires adding a streaming ingestion path to a pipeline designed and submitted as a batch system at Stages 1 and 2. The mobile product team needs current balances and recent transactions updated within 5 minutes of a transaction event — the daily batch pipeline cannot satisfy this SLA.
 
-[Describe: what did the mobile product team need? What did the streaming interface look like — directory of micro-batch JSONL files, delivered to `/data/stream/`, requiring polling? What output tables were required (`current_balances`, `recent_transactions`) and what SLA applied (5-minute lag from file arrival to Gold update)?]
+The streaming interface delivers 12 pre-staged JSONL micro-batch files to `/data/stream/`, each containing 50–500 transaction events. The pipeline must poll this directory, process files in chronological order, and maintain two Gold output tables: `current_balances` (one row per account, upsert semantics) and `recent_transactions` (last 50 transactions per account, merge/evict semantics). Both tables must reflect events within 300 seconds of the source event timestamp for full SLA credit.
 
-[Also describe: what was the state of your pipeline coming into Stage 3? Approximately how many lines of code, what structure, what had you changed between Stage 1 and Stage 2?]
+At the start of Stage 3, the pipeline consisted of five modules: `utils.py` (~60 lines), `ingest.py` (~80 lines), `transform.py` (~160 lines), `provision.py` (~180 lines), and `run_all.py` (~40 lines). The Stage 1 to Stage 2 transition added `dq_rules.yaml`, DQ flagging logic in `transform.py`, and `_write_dq_report()` in `provision.py` without modifying any existing function signatures — the diff was additive, not structural.
 
 ---
 
 ## Decision 1: How did your existing Stage 1 architecture facilitate or hinder the streaming extension?
 
-**Minimum: approximately 100 words of specific reasoning about your own pipeline.**
+**What made Stage 3 easier:**
 
-[Address at least the following:]
+The config-driven path setup in `pipeline_config.yaml` made adding new paths straightforward. At Stage 1, all input and output paths were externalised under `input:`, `output:`, and `spark:` keys. Adding `streaming.stream_input_path` and `streaming.stream_gold_path` required editing only the config file — no path strings needed to change in pipeline code. This is the direct payoff of the design principle stated in the brief: "designs that hardcode file paths will require more rework."
 
-[**What made Stage 3 easier:**]
-[— Which specific design choices in Stage 1 or Stage 2 reduced the work required to add the streaming path. Examples: did you already have a modular ingestion layer that made it easy to add a new input source? Did your Delta MERGE pattern from Stage 2 transfer directly to the streaming upsert logic? Was your config-driven path setup easy to extend with a `/data/stream/` source?]
+The Delta Lake session configuration established in `utils.py` — JAR loading, the DeltaSparkSessionExtension, the DeltaCatalog — transfers directly to the streaming path without modification. `get_spark()` returns a session that can write Delta MERGE operations the streaming path requires, because Delta support was wired at the session level, not per-table. The streaming path calls `get_spark()` and gets a fully capable session.
 
-[**What made Stage 3 harder:**]
-[— Which specific choices created friction. Examples: did you use a monolithic `run_all.py` that combined batch and stream concerns in a way that was difficult to separate? Did you have hardcoded schema assumptions that broke when the new `current_balances` table was introduced? Did your Spark session configuration conflict with the polling loop's concurrency requirements?]
+The hash-based surrogate key function `_make_sk()` in `provision.py` is stateless and row-level — it computes a deterministic BIGINT from any string column with zero shuffle. This means it works identically on a 1M-row batch DataFrame and on a 50-row streaming micro-batch. If surrogate keys had used `row_number()` over a global window, the streaming path would have required a completely different key generation approach.
 
-[**Code survival rate:**]
-[— Roughly what fraction of your Stage 1/2 code survived intact into Stage 3? What had to be modified versus extended versus rewritten?]
+**What made Stage 3 harder:**
+
+The single `run_all.py` entry point calls `run_ingestion()`, `run_transformation()`, and `run_provisioning()` sequentially and exits. There is no concept of a long-running process or a polling loop. Adding Stage 3 required introducing a fourth execution concern that must run after the batch path completes — a concern the original entry point was not designed to accommodate. The `if __name__ == "__main__"` block needed a new branching conditional, which makes the entry point structurally more complex and harder to test independently.
+
+The DQ flagging logic in `_transform_transactions()` is tightly coupled to a full Bronze Delta read. The streaming path processes micro-batches of 50–500 events that also need currency normalisation and type casting. Reusing `_transform_transactions()` directly is not possible — it reads from `/data/output/bronze/transactions/`, not from an in-memory DataFrame. A streaming-specific normalisation path duplicates the logic unless it is first extracted to a shared helper.
+
+**Code survival rate:**
+
+`utils.py`, `ingest.py`, and `run_all.py` survive intact — approximately 35% of total line count. `transform.py` and `provision.py` require additive changes only — new functions, no rewrites of existing ones. The new `stream_ingest.py` is entirely additive. Approximately 80% of Stage 1/2 code survives into Stage 3 without modification.
 
 ---
 
 ## Decision 2: What design decisions in Stage 1 would you change in hindsight?
 
-**Minimum: approximately 100 words of specific, concrete changes.**
+**Extract a stateless normalisation function from `_transform_transactions()` in `transform.py`:**
 
-[Be specific. "I would have..." followed by a concrete architectural choice and an explanation of why it would have improved Stage 3. General statements are not sufficient.]
+Currently the currency normalisation, date parsing, and amount casting logic is embedded inline inside `_transform_transactions()`, which starts with a Bronze Delta read. For Stage 3, the same normalisation needs to run on streaming micro-batch DataFrames. If I had extracted a `_normalise_transaction_df(df: DataFrame) -> DataFrame` function that accepts any DataFrame and returns a normalised one, both the batch path and the streaming path would call the same function. `_transform_transactions()` would simply call `_normalise_transaction_df(df)` after the Bronze read. The streaming path would call `_normalise_transaction_df(micro_batch_df)` directly. No duplication, no divergence between batch and stream normalisation logic.
 
-[Examples of the level of specificity required:]
-[— "I would have defined my Gold table schemas in a single `config/schemas.py` file rather than inline in `provision.py`. When I needed to add the `current_balances` table in Stage 3, I had to trace schema definitions across three modules."]
-[— "I would have designed `run_all.py` to accept a `--mode` argument (`batch` or `stream`) from the start, rather than adding a branching conditional in Stage 3 that made the entry point harder to reason about."]
-[— "I would not have used `.toPandas()` in my Silver-to-Gold join. It worked at Stage 1 scale but I had to refactor it at Stage 2, and the refactor left technical debt that complicated the Stage 3 streaming path."]
+**Design `run_all.py` with a `--mode` argument from Day 1:**
 
-[Describe at least one concrete structural change.]
+The current entry point has no argument parsing — it runs the full pipeline unconditionally. If I had added `import argparse` and a `--mode` flag accepting `batch`, `stream`, or `full` from the start, adding Stage 3 would have been one new branch in the main block and one new function call. Instead, Stage 3 required restructuring the entry point itself. A concrete example: `python pipeline/run_all.py --mode stream` would run only the polling loop, making it independently testable without running the full batch pipeline first. This would have saved significant debugging time.
+
+**Use Delta MERGE for Gold writes instead of overwrite in `provision.py`:**
+
+Every Gold table write in `provision.py` uses `.mode("overwrite")`. This is correct for daily batch loads but creates a gap at Stage 3: `current_balances` requires upsert semantics — merge if account exists, insert if not. If all Gold writes had used Delta MERGE from Day 1, the streaming path would reuse the exact same write pattern. Switching from overwrite to MERGE at Stage 3 means modifying `_build_dim_customers()`, `_build_dim_accounts()`, and `_build_fact_transactions()` retroactively — three functions that were otherwise stable.
 
 ---
 
 ## Decision 3: How would you approach this differently if you had known Stage 3 was coming from the start?
 
-**Minimum: approximately 100 words of forward-looking architectural reasoning.**
+**Stateless normalisation layer shared by batch and stream:**
 
-[This is the forward-looking design question. Describe the architecture you would have chosen from Day 1 if the full three-stage specification had been visible to you at the start.]
+From Day 1, I would have separated data normalisation from data movement. `transform.py` would expose a `normalise_transactions(df)` function that takes any DataFrame and returns a cleaned one — no Bronze reads, no Silver writes, just transformations. The batch path would call it as part of `_transform_transactions()`. The streaming path would call it on each micro-batch. This single change eliminates the biggest source of streaming friction without adding any complexity to Stage 1 or Stage 2.
 
-[Consider addressing:]
-[— **Ingestion patterns:** Would you have designed the ingest layer to accept both batch file paths and streaming directory sources from the beginning? What interface would that look like?]
-[— **State management:** The `current_balances` table requires maintaining running state across stream batches. Would you have chosen a different state management approach if you had known this from Day 1? Delta MERGE, checkpoint files, an embedded key-value store?]
-[— **Output format choices:** Would you have structured your Gold layer differently — for example, using a single `gold/` output module that handles both batch and streaming tables — rather than retrofitting `stream_gold/` as a separate output path?]
-[— **Pipeline entry points:** Would you have used a single entry point with mode selection, or kept batch and streaming as separate executables that share common library code?]
-[— **Anything else** specific to your implementation that would have changed with full visibility.]
+**Delta MERGE as the default write pattern:**
 
----
+If I had known Stage 3 required upsert semantics, I would have built a `_merge_to_delta(df, path, merge_key)` utility in `utils.py` from the start. The batch pipeline would call it with the full Silver dataset on each run — idempotent, safe for re-runs, identical behaviour to overwrite for a fresh table. The streaming pipeline would call it with each micro-batch. One write utility, two callers, no duplication. The `current_balances` upsert and `recent_transactions` merge would be implemented as thin wrappers around the same utility.
 
-## Appendix (optional)
+**Single entry point with explicit mode selection and shared library code:**
 
-[Architecture diagram, code snippets, or other supporting material. Not required. Does not substitute for the written responses above. If you include a diagram, describe what it shows in plain text as well — reviewers may not have access to rendering tools.]
+The architecture I would have chosen from Day 1: `run_all.py` accepts `--mode batch|stream|full`. Batch mode runs ingest → transform → provision and exits. Stream mode starts the polling loop, processes all files in `/data/stream/`, and exits after a configurable quiesce timeout. Full mode runs batch first, then hands off to the stream loop. All shared logic — SparkSession, DQ normalisation, Delta writes — lives in the existing modules and is imported by both modes. The entry point stays thin: argument parsing and orchestration only. This makes each mode independently testable, independently invocable, and independently debuggable — which at Stage 3 with a 30-minute hard timeout is not a luxury but a necessity.
